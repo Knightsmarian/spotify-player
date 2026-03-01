@@ -1067,64 +1067,43 @@ impl AppClient {
 
     /// Search for items (tracks, artists, albums, playlists) matching a given query
     pub async fn search(&self, query: &str) -> Result<SearchResults> {
-        let (
-            track_result,
-            artist_result,
-            album_result,
-            playlist_result,
-            show_result,
-            episode_result,
-        ) = tokio::try_join!(
-            self.search_specific_type(query, rspotify::model::SearchType::Track),
-            self.search_specific_type(query, rspotify::model::SearchType::Artist),
-            self.search_specific_type(query, rspotify::model::SearchType::Album),
-            self.search_specific_type(query, rspotify::model::SearchType::Playlist),
-            self.search_specific_type(query, rspotify::model::SearchType::Show),
-            self.search_specific_type(query, rspotify::model::SearchType::Episode)
-        )?;
+        let mut tracks = vec![];
+        let mut artists = vec![];
+        let mut albums = vec![];
+        let mut playlists = vec![];
+        let mut shows = vec![];
+        let mut episodes = vec![];
 
-        let (tracks, artists, albums, playlists, shows, episodes) = (
-            match track_result {
-                rspotify::model::SearchResult::Tracks(p) => p
-                    .items
-                    .into_iter()
-                    .filter_map(Track::try_from_full_track)
-                    .collect(),
-                _ => anyhow::bail!("expect a track search result"),
-            },
-            match artist_result {
-                rspotify::model::SearchResult::Artists(p) => {
-                    p.items.into_iter().map(std::convert::Into::into).collect()
-                }
-                _ => anyhow::bail!("expect an artist search result"),
-            },
-            match album_result {
-                rspotify::model::SearchResult::Albums(p) => p
-                    .items
-                    .into_iter()
-                    .filter_map(Album::try_from_simplified_album)
-                    .collect(),
-                _ => anyhow::bail!("expect an album search result"),
-            },
-            match playlist_result {
-                rspotify::model::SearchResult::Playlists(p) => {
-                    p.items.into_iter().map(std::convert::Into::into).collect()
-                }
-                _ => anyhow::bail!("expect a playlist search result"),
-            },
-            match show_result {
-                rspotify::model::SearchResult::Shows(p) => {
-                    p.items.into_iter().map(std::convert::Into::into).collect()
-                }
-                _ => anyhow::bail!("expect a show search result"),
-            },
-            match episode_result {
-                rspotify::model::SearchResult::Episodes(p) => {
-                    p.items.into_iter().map(std::convert::Into::into).collect()
-                }
-                _ => anyhow::bail!("expect a episode search result"),
-            },
-        );
+        if let Ok(rspotify::model::SearchResult::Tracks(p)) =
+            self.search_specific_type(query, rspotify::model::SearchType::Track).await
+        {
+            tracks = p.items.into_iter().filter_map(Track::try_from_full_track).collect();
+        }
+        if let Ok(rspotify::model::SearchResult::Artists(p)) =
+            self.search_specific_type(query, rspotify::model::SearchType::Artist).await
+        {
+            artists = p.items.into_iter().map(std::convert::Into::into).collect();
+        }
+        if let Ok(rspotify::model::SearchResult::Albums(p)) =
+            self.search_specific_type(query, rspotify::model::SearchType::Album).await
+        {
+            albums = p.items.into_iter().filter_map(Album::try_from_simplified_album).collect();
+        }
+        if let Ok(rspotify::model::SearchResult::Playlists(p)) =
+            self.search_specific_type(query, rspotify::model::SearchType::Playlist).await
+        {
+            playlists = p.items.into_iter().map(std::convert::Into::into).collect();
+        }
+        if let Ok(rspotify::model::SearchResult::Shows(p)) =
+            self.search_specific_type(query, rspotify::model::SearchType::Show).await
+        {
+            shows = p.items.into_iter().map(std::convert::Into::into).collect();
+        }
+        if let Ok(rspotify::model::SearchResult::Episodes(p)) =
+            self.search_specific_type(query, rspotify::model::SearchType::Episode).await
+        {
+            episodes = p.items.into_iter().map(std::convert::Into::into).collect();
+        }
 
         Ok(SearchResults {
             tracks,
@@ -1457,11 +1436,22 @@ impl AppClient {
         let playlist_uri = playlist_id.uri();
         tracing::info!("Get playlist context: {}", playlist_uri);
 
+        #[derive(Deserialize, Debug)]
+        struct FlexiblePlaylist {
+            pub id: PlaylistId<'static>,
+            pub collaborative: bool,
+            pub name: String,
+            pub owner: rspotify::model::PublicUser,
+            pub description: Option<String>,
+            pub snapshot_id: String,
+            #[serde(alias = "items")]
+            pub tracks: rspotify::model::Page<serde_json::Value>,
+        }
+
         let playlist = self
-            .playlist(
-                playlist_id.clone(),
-                None,
-                Some(rspotify::model::Market::FromToken),
+            .http_get::<FlexiblePlaylist>(
+                &format!("{SPOTIFY_API_ENDPOINT}/playlists/{}", playlist_id.id()),
+                &Query::from([("market", "from_token")]),
             )
             .await?;
 
@@ -1478,8 +1468,24 @@ impl AppClient {
             .filter_map(Track::try_from_playlist_item)
             .collect::<Vec<_>>();
 
+        // manual conversion to state::Playlist
+        let re = regex::Regex::new("(<.*?>|</.*?>)").expect("valid regex");
+        let desc = playlist.description.unwrap_or_default();
+        let desc = html_escape::decode_html_entities(&re.replace_all(&desc, "")).to_string();
+
         Ok(Context::Playlist {
-            playlist: playlist.into(),
+            playlist: Playlist {
+                id: playlist.id,
+                name: playlist.name,
+                collaborative: playlist.collaborative,
+                owner: (
+                    playlist.owner.display_name.unwrap_or_default(),
+                    playlist.owner.id,
+                ),
+                desc,
+                current_folder_id: 0,
+                snapshot_id: playlist.snapshot_id,
+            },
             tracks,
         })
     }
@@ -1490,7 +1496,10 @@ impl AppClient {
         tracing::info!("Get album context: {}", album_uri);
 
         let album = self
-            .album(album_id.clone(), Some(rspotify::model::Market::FromToken))
+            .http_get::<rspotify::model::FullAlbum>(
+                &format!("{SPOTIFY_API_ENDPOINT}/albums/{}", album_id.id()),
+                &Query::from([("market", "from_token")]),
+            )
             .await?;
 
         let total_tracks = album.tracks.total as usize;
@@ -1630,7 +1639,7 @@ impl AppClient {
     where
         T: serde::de::DeserializeOwned + std::fmt::Debug,
     {
-        const PAGE_LIMIT: usize = 50;
+        const PAGE_LIMIT: usize = 10;
         const MAX_PARALLEL: usize = 2;
 
         let mut all_items = Vec::new();
