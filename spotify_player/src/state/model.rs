@@ -479,6 +479,23 @@ impl Track {
     pub fn try_from_value(value: serde_json::Value) -> Option<Self> {
         serde_json::from_value(value).ok()
     }
+
+    /// tries to convert from a simplified track `serde_json::Value` into `Track`
+    pub fn try_from_simplified_track_value(value: serde_json::Value) -> Option<Self> {
+        serde_json::from_value(value).ok()
+    }
+
+    /// tries to convert from a playlist item `serde_json::Value` into `Track`
+    pub fn try_from_playlist_item_value(value: serde_json::Value) -> Option<Self> {
+        let track_v = value.get("track")?.clone();
+        let mut track = Track::try_from_value(track_v)?;
+        if let Some(added_at) = value.get("added_at").and_then(|v| v.as_str()) {
+            if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(added_at) {
+                track.added_at = ts.timestamp() as u64;
+            }
+        }
+        Some(track)
+    }
 }
 
 impl std::fmt::Display for Track {

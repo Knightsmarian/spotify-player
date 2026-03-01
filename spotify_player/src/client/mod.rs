@@ -1531,22 +1531,23 @@ impl AppClient {
             pub id: PlaylistId<'static>,
             pub collaborative: bool,
             pub name: String,
-            pub owner: rspotify::model::PublicUser,
+            pub owner: serde_json::Value,
             pub description: Option<String>,
             pub snapshot_id: String,
             #[serde(alias = "items")]
             pub tracks: rspotify::model::Page<serde_json::Value>,
         }
 
-        let playlist = self
-            .http_get::<FlexiblePlaylist>(
+        let playlist_v = self
+            .http_get::<serde_json::Value>(
                 &format!("{SPOTIFY_API_ENDPOINT}/playlists/{}", playlist_id.id()),
                 &Query::from([("market", "from_token")]),
             )
             .await?;
+        let playlist: FlexiblePlaylist = serde_json::from_value(playlist_v.clone()).context("parse playlist")?;
 
         let tracks = self
-            .all_paging_items(
+            .all_paging_items::<serde_json::Value>(
                 &format!(
                     "{SPOTIFY_API_ENDPOINT}/playlists/{}/tracks",
                     playlist_id.id(),
@@ -1555,7 +1556,7 @@ impl AppClient {
             )
             .await?
             .into_iter()
-            .filter_map(Track::try_from_playlist_item)
+            .filter_map(Track::try_from_playlist_item_value)
             .collect::<Vec<_>>();
 
         // manual conversion to state::Playlist
@@ -1563,15 +1564,17 @@ impl AppClient {
         let desc = playlist.description.unwrap_or_default();
         let desc = html_escape::decode_html_entities(&re.replace_all(&desc, "")).to_string();
 
+        let owner = match serde_json::from_value::<(String, UserId<'static>)>(playlist.owner) {
+            Ok(o) => o,
+            Err(_) => ("Unknown".to_string(), UserId::from_id("unknown").expect("valid id")),
+        };
+
         Ok(Context::Playlist {
             playlist: Playlist {
                 id: playlist.id,
                 name: playlist.name,
                 collaborative: playlist.collaborative,
-                owner: (
-                    playlist.owner.display_name.unwrap_or_default(),
-                    playlist.owner.id,
-                ),
+                owner,
                 desc,
                 current_folder_id: 0,
                 snapshot_id: playlist.snapshot_id,
@@ -1585,38 +1588,35 @@ impl AppClient {
         let album_uri = album_id.uri();
         tracing::info!("Get album context: {}", album_uri);
 
-        let album = self
-            .http_get::<rspotify::model::FullAlbum>(
+        let album_v = self
+            .http_get::<serde_json::Value>(
                 &format!("{SPOTIFY_API_ENDPOINT}/albums/{}", album_id.id()),
                 &Query::from([("market", "from_token")]),
             )
             .await?;
+        let state_album: Album = serde_json::from_value(album_v.clone()).context("parse album")?;
 
-        let total_tracks = album.tracks.total as usize;
-
-        // converts `rspotify::model::FullAlbum` into `state::Album`
-        let album: Album = album.into();
+        let total_tracks = album_v.get("tracks").and_then(|t| t.get("total")).and_then(|t| t.as_u64()).unwrap_or(0) as usize;
 
         // get the album's tracks
         let tracks = self
-            .all_paging_items(
+            .all_paging_items::<serde_json::Value>(
                 &format!("{SPOTIFY_API_ENDPOINT}/albums/{}/tracks", album_id.id()),
                 total_tracks,
             )
             .await?
             .into_iter()
-            .filter_map(|t| {
-                // simplified track doesn't have album so
-                // we need to manually include one during
-                // converting into `state::Track`
-                Track::try_from_simplified_track(t).map(|mut t| {
-                    t.album = Some(album.clone());
-                    t
-                })
+            .filter_map(|v| {
+                let mut track = Track::try_from_simplified_track_value(v)?;
+                track.album = Some(state_album.clone());
+                Some(track)
             })
             .collect::<Vec<_>>();
 
-        Ok(Context::Album { album, tracks })
+        Ok(Context::Album {
+            album: state_album,
+            tracks,
+        })
     }
 
     /// Get an artist context data
@@ -1624,36 +1624,23 @@ impl AppClient {
         let artist_uri = artist_id.uri();
         tracing::info!("Get artist context: {}", artist_uri);
 
-        // get the artist's information, including top tracks, related artists, and albums
+        let artist = self.artist(artist_id.as_ref()).await?;
 
-        let artist = self
-            .artist(artist_id.as_ref())
-            .await
-            .context("get artist")?
-            .into();
+        let top_tracks_v = self
+            .http_get::<serde_json::Value>(
+                &format!("{SPOTIFY_API_ENDPOINT}/artists/{}/top-tracks", artist_id.id()),
+                &Query::from([("market", "from_token")]),
+            )
+            .await?;
+        
+        let top_tracks = top_tracks_v.get("tracks")
+            .and_then(|t| t.as_array())
+            .map(|a| a.iter().filter_map(|v| Track::try_from_value(v.clone())).collect())
+            .unwrap_or_default();
 
-        let top_tracks = self
-            .artist_top_tracks(artist_id.as_ref(), Some(rspotify::model::Market::FromToken))
-            .await
-            .context("get artist's top tracks")?
-            .into_iter()
-            .filter_map(Track::try_from_full_track)
-            .collect::<Vec<_>>();
+        let related_artists = self.artist_related_artists(artist_id.as_ref()).await.unwrap_or_default();
 
-        #[allow(deprecated)]
-        let related_artists = self
-            .artist_related_artists(artist_id.as_ref())
-            .await
-            .ok()
-            .unwrap_or_default()
-            .into_iter()
-            .map(std::convert::Into::into)
-            .collect::<Vec<_>>();
-
-        let albums = self
-            .artist_albums(artist_id.as_ref())
-            .await
-            .context("get artist's albums")?;
+        let albums = self.artist_albums(artist_id.as_ref()).await.unwrap_or_default();
 
         Ok(Context::Artist {
             artist,
