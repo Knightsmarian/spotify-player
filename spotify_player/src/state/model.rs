@@ -807,33 +807,3 @@ impl From<librespot_metadata::lyrics::Lyrics> for Lyrics {
         Self { lines }
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn test_track_deser_lenient() {
-        let json_val = json!({
-            "id": "6TKd6LlPgJEJErUS0I3iMv",
-            "name": "Studying a Pinecone",
-            "artists": [
-                { "id": "3h100hRlLZ7QDz8GRt5QsD", "name": "Lullatone" }
-            ],
-            "album": {
-                "id": "3AWATaNWvlDlTOmlemNQDw",
-                "name": "Thinking About Thursdays",
-                "release_date": "2017-02-21",
-                "artists": [
-                    { "id": "3h100hRlLZ7QDz8GRt5QsD", "name": "Lullatone" }
-                ]
-            },
-            "duration_ms": 186000,
-            "explicit": false
-        });
-
-        let track: Result<Track, _> = serde_json::from_value(json_val);
-        println!("Track result: {:?}", track);
-    }
-}
