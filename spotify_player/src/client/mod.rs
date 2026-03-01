@@ -124,6 +124,44 @@ impl AppClient {
             .clone())
     }
 
+    async fn library_modify(&self, uris: Vec<String>, method: reqwest::Method) -> Result<()> {
+        let token = self.token().await?;
+        let url = format!("{SPOTIFY_API_ENDPOINT}/me/library");
+        let body = serde_json::json!({ "uris": uris });
+
+        let response = self
+            .http
+            .request(method, &url)
+            .header("Authorization", format!("Bearer {token}"))
+            .json(&body)
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            anyhow::bail!("failed to modify library: {}", response.status());
+        }
+        Ok(())
+    }
+
+    async fn library_contains(&self, uris: Vec<String>) -> Result<Vec<bool>> {
+        let token = self.token().await?;
+        let url = format!("{SPOTIFY_API_ENDPOINT}/me/library/contains");
+        let uris_param = uris.join(",");
+
+        let response = self
+            .http
+            .get(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .query(&[("uris", &uris_param)])
+            .send()
+            .await?;
+
+        if !response.status().is_success() {
+            anyhow::bail!("failed to check library: {}", response.status());
+        }
+        Ok(response.json::<Vec<bool>>().await?)
+    }
+
     /// Initialize the application's playback upon creating a new session or during startup
     pub fn initialize_playback(&self, state: &SharedState) {
         tokio::task::spawn({
@@ -689,9 +727,16 @@ impl AppClient {
 
     /// Get Spotify's available browse categories
     pub async fn browse_categories(&self) -> Result<Vec<Category>> {
-        let first_page = self
+        let first_page = match self
             .categories_manual(Some("EN"), None, Some(50), None)
-            .await?;
+            .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("Failed to get browse categories: {e:#}");
+                return Ok(vec![]);
+            }
+        };
 
         Ok(first_page.items.into_iter().map(Category::from).collect())
     }
@@ -719,20 +764,27 @@ impl AppClient {
             playlists: rspotify::model::Page<serde_json::Value>,
         }
 
-        Ok(self
+        Ok(match self
             .http_get::<BrowseCategoryPlaylistsResponse>(
                 &format!("{SPOTIFY_API_ENDPOINT}/browse/categories/{category_id}/playlists"),
                 &Query::from([("limit", "50")]),
             )
-            .await?
-            .playlists
-            .items
-            .into_iter()
-            .filter_map(|item| {
-                serde_json::from_value::<rspotify::model::SimplifiedPlaylist>(item).ok()
-            })
-            .map(Into::into)
-            .collect())
+            .await
+        {
+            Ok(r) => r
+                .playlists
+                .items
+                .into_iter()
+                .filter_map(|item| {
+                    serde_json::from_value::<rspotify::model::SimplifiedPlaylist>(item).ok()
+                })
+                .map(Into::into)
+                .collect(),
+            Err(e) => {
+                tracing::warn!("Failed to get browse category playlists: {e:#}");
+                vec![]
+            }
+        })
     }
 
     /// Find an available device. If found, return the device's ID.
@@ -818,12 +870,19 @@ impl AppClient {
 
     /// Get the top tracks of the current user
     pub async fn current_user_top_tracks(&self) -> Result<Vec<Track>> {
-        let tracks = self
+        let tracks = match self
             .all_paging_items::<rspotify::model::FullTrack>(
                 &format!("{SPOTIFY_API_ENDPOINT}/me/top/tracks"),
                 0, // we don't know the total number of top tracks beforehand
             )
-            .await?;
+            .await
+        {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::warn!("Failed to get top tracks: {e:#}");
+                return Ok(vec![]);
+            }
+        };
 
         Ok(tracks
             .into_iter()
@@ -996,13 +1055,12 @@ impl AppClient {
             .filter_map(|t| TrackId::from_id(t.original_gid).ok());
 
         // Retrieve tracks based on IDs
-        let tracks = self
-            .tracks(track_ids, Some(rspotify::model::Market::FromToken))
-            .await?;
-        let tracks = tracks
-            .into_iter()
-            .filter_map(Track::try_from_full_track)
-            .collect();
+        let mut tracks = Vec::new();
+        for id in track_ids {
+            if let Ok(track) = self.track(id).await {
+                tracks.push(track);
+            }
+        }
 
         Ok(tracks)
     }
@@ -1086,8 +1144,76 @@ impl AppClient {
     ) -> Result<rspotify::model::SearchResult> {
         Ok(self
             .deref()
-            .search(query, typ, None, None, None, None)
+            .search(query, typ, None, None, Some(10), None)
             .await?)
+    }
+
+    pub async fn current_user_saved_tracks_add<I, ID>(&self, ids: I) -> Result<()>
+    where
+        I: IntoIterator<Item = ID>,
+        ID: rspotify::model::Id,
+    {
+        let uris = ids.into_iter().map(|id| id.uri()).collect();
+        self.library_modify(uris, reqwest::Method::PUT).await
+    }
+
+    pub async fn current_user_saved_tracks_delete<I, ID>(&self, ids: I) -> Result<()>
+    where
+        I: IntoIterator<Item = ID>,
+        ID: rspotify::model::Id,
+    {
+        let uris = ids.into_iter().map(|id| id.uri()).collect();
+        self.library_modify(uris, reqwest::Method::DELETE).await
+    }
+
+    pub async fn current_user_saved_albums_add<I, ID>(&self, ids: I) -> Result<()>
+    where
+        I: IntoIterator<Item = ID>,
+        ID: rspotify::model::Id,
+    {
+        let uris = ids.into_iter().map(|id| id.uri()).collect();
+        self.library_modify(uris, reqwest::Method::PUT).await
+    }
+
+    pub async fn current_user_saved_albums_delete<I, ID>(&self, ids: I) -> Result<()>
+    where
+        I: IntoIterator<Item = ID>,
+        ID: rspotify::model::Id,
+    {
+        let uris = ids.into_iter().map(|id| id.uri()).collect();
+        self.library_modify(uris, reqwest::Method::DELETE).await
+    }
+
+    pub async fn current_user_saved_tracks_contains<I, ID>(&self, ids: I) -> Result<Vec<bool>>
+    where
+        I: IntoIterator<Item = ID>,
+        ID: rspotify::model::Id,
+    {
+        let uris = ids.into_iter().map(|id| id.uri()).collect();
+        self.library_contains(uris).await
+    }
+
+    pub async fn current_user_saved_albums_contains<I, ID>(&self, ids: I) -> Result<Vec<bool>>
+    where
+        I: IntoIterator<Item = ID>,
+        ID: rspotify::model::Id,
+    {
+        let uris = ids.into_iter().map(|id| id.uri()).collect();
+        self.library_contains(uris).await
+    }
+
+    pub async fn artist_top_tracks(
+        &self,
+        artist_id: rspotify::model::ArtistId<'_>,
+        market: Option<rspotify::model::Market>,
+    ) -> Result<Vec<rspotify::model::FullTrack>> {
+        match self.deref().artist_top_tracks(artist_id, market).await {
+            Ok(t) => Ok(t),
+            Err(e) => {
+                tracing::warn!("Failed to get artist top tracks: {e:#}");
+                Ok(vec![])
+            }
+        }
     }
 
     /// Add a playable item to a playlist
@@ -1505,7 +1631,7 @@ impl AppClient {
         T: serde::de::DeserializeOwned + std::fmt::Debug,
     {
         const PAGE_LIMIT: usize = 50;
-        const MAX_PARALLEL: usize = 8;
+        const MAX_PARALLEL: usize = 2;
 
         let mut all_items = Vec::new();
         let mut offset = 0;
@@ -1596,22 +1722,18 @@ impl AppClient {
 
             let prev_item = player.currently_playing();
 
-            let prev_name = match prev_item {
-                Some(rspotify::model::PlayableItem::Track(track)) => track.name.clone(),
-                Some(rspotify::model::PlayableItem::Episode(episode)) => episode.name.clone(),
-                Some(rspotify::model::PlayableItem::Unknown(_)) | None => String::new(),
-            };
+            let prev_name = prev_item
+                .map(crate::utils::get_playable_item_name)
+                .unwrap_or_default();
 
             player.playback = playback;
             player.playback_last_updated_time = Some(std::time::Instant::now());
 
             let curr_item = player.currently_playing();
 
-            let curr_name = match curr_item {
-                Some(rspotify::model::PlayableItem::Track(track)) => track.name.clone(),
-                Some(rspotify::model::PlayableItem::Episode(episode)) => episode.name.clone(),
-                Some(rspotify::model::PlayableItem::Unknown(_)) | None => String::new(),
-            };
+            let curr_name = curr_item
+                .map(crate::utils::get_playable_item_name)
+                .unwrap_or_default();
 
             let new_playback = prev_name != curr_name && !curr_name.is_empty();
             // check if we need to update the buffered playback

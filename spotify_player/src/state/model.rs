@@ -138,20 +138,35 @@ pub struct Track {
     pub name: String,
     pub artists: Vec<Artist>,
     pub album: Option<Album>,
+    #[serde(rename = "duration_ms", deserialize_with = "deserialize_duration", default)]
     pub duration: std::time::Duration,
+    #[serde(default)]
     pub explicit: bool,
     #[serde(skip)]
     pub added_at: u64,
+}
+
+fn deserialize_duration<'de, D>(deserializer: D) -> Result<std::time::Duration, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let ms = u64::deserialize(deserializer).unwrap_or_default();
+    Ok(std::time::Duration::from_millis(ms))
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 /// A Spotify album
 pub struct Album {
     pub id: AlbumId<'static>,
+    #[serde(default)]
     pub release_date: String,
     pub name: String,
     pub artists: Vec<Artist>,
+    #[serde(rename = "album_type")]
     pub typ: Option<rspotify::model::AlbumType>,
+    #[serde(default)]
+    pub images: Vec<rspotify::model::Image>,
+    #[serde(default)]
     pub added_at: u64,
 }
 
@@ -188,10 +203,22 @@ pub struct Show {
 pub struct Episode {
     pub id: EpisodeId<'static>,
     pub name: String,
+    #[serde(default)]
     pub description: String,
+    #[serde(rename = "duration_ms", deserialize_with = "deserialize_duration", default)]
     pub duration: std::time::Duration,
     pub show: Option<Show>,
+    #[serde(default)]
     pub release_date: String,
+    #[serde(default)]
+    pub images: Vec<rspotify::model::Image>,
+}
+
+impl Episode {
+    /// tries to convert from a `serde_json::Value` into `Episode`
+    pub fn try_from_value(value: serde_json::Value) -> Option<Self> {
+        serde_json::from_value(value).ok()
+    }
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
@@ -405,11 +432,24 @@ impl Track {
 
     /// tries to convert from a `rspotify::model::PlaylistItem` into `Track`
     pub fn try_from_playlist_item(item: rspotify::model::PlaylistItem) -> Option<Self> {
-        let rspotify::model::PlayableItem::Track(track) = item.track? else {
-            return None;
-        };
+        match item.track? {
+            rspotify::model::PlayableItem::Track(track) => {
+                Track::try_from_full_track_with_date(track, item.added_at)
+            }
+            rspotify::model::PlayableItem::Unknown(value) => {
+                let mut track = Track::try_from_value(value)?;
+                if let Some(added_at) = item.added_at {
+                    track.added_at = added_at.timestamp() as u64;
+                }
+                Some(track)
+            }
+            _ => None,
+        }
+    }
 
-        Track::try_from_full_track_with_date(track, item.added_at)
+    /// tries to convert from a `serde_json::Value` into `Track`
+    pub fn try_from_value(value: serde_json::Value) -> Option<Self> {
+        serde_json::from_value(value).ok()
     }
 }
 
@@ -444,6 +484,7 @@ impl Album {
                     "compilation" => Some(rspotify::model::AlbumType::Compilation),
                     _ => None,
                 }),
+            images: vec![],
             added_at: 0,
         })
     }
@@ -474,6 +515,7 @@ impl From<rspotify::model::FullAlbum> for Album {
             release_date: album.release_date,
             artists: from_simplified_artists_to_artists(album.artists),
             typ: Some(album.album_type),
+            images: album.images,
             added_at: 0,
         }
     }
@@ -621,6 +663,7 @@ impl From<rspotify::model::SimplifiedEpisode> for Episode {
             duration: episode.duration.to_std().expect("valid chrono duration"),
             show: None,
             release_date: episode.release_date,
+            images: episode.images,
         }
     }
 }
@@ -634,6 +677,7 @@ impl From<rspotify::model::FullEpisode> for Episode {
             duration: episode.duration.to_std().expect("valid chrono duration"),
             show: Some(episode.show.into()),
             release_date: episode.release_date,
+            images: episode.images,
         }
     }
 }
@@ -761,5 +805,35 @@ impl From<librespot_metadata::lyrics::Lyrics> for Lyrics {
             .collect::<Vec<_>>();
         lines.sort_by_key(|l| l.0);
         Self { lines }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_track_deser_lenient() {
+        let json_val = json!({
+            "id": "6TKd6LlPgJEJErUS0I3iMv",
+            "name": "Studying a Pinecone",
+            "artists": [
+                { "id": "3h100hRlLZ7QDz8GRt5QsD", "name": "Lullatone" }
+            ],
+            "album": {
+                "id": "3AWATaNWvlDlTOmlemNQDw",
+                "name": "Thinking About Thursdays",
+                "release_date": "2017-02-21",
+                "artists": [
+                    { "id": "3h100hRlLZ7QDz8GRt5QsD", "name": "Lullatone" }
+                ]
+            },
+            "duration_ms": 186000,
+            "explicit": false
+        });
+
+        let track: Result<Track, _> = serde_json::from_value(json_val);
+        println!("Track result: {:?}", track);
     }
 }

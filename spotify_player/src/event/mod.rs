@@ -95,11 +95,9 @@ fn handle_mouse_event(
                 // calculate the seek position (in ms) based on the mouse click position,
                 // the progress bar's width and the track's duration (in ms)
                 let player = state.player.read();
-                let duration = match player.currently_playing() {
-                    Some(rspotify::model::PlayableItem::Track(track)) => Some(track.duration),
-                    Some(rspotify::model::PlayableItem::Episode(episode)) => Some(episode.duration),
-                    Some(rspotify::model::PlayableItem::Unknown(_)) | None => None,
-                };
+                let duration = player
+                    .currently_playing()
+                    .and_then(crate::utils::get_playable_item_duration);
                 if let Some(duration) = duration {
                     let position_ms = (duration.num_milliseconds()) * i64::from(event.column)
                         / i64::from(rect.width);
