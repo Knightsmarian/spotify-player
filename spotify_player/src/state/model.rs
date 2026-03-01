@@ -135,7 +135,9 @@ pub struct Device {
 /// A Spotify track
 pub struct Track {
     pub id: TrackId<'static>,
+    #[serde(default)]
     pub name: String,
+    #[serde(default)]
     pub artists: Vec<Artist>,
     pub album: Option<Album>,
     #[serde(rename = "duration_ms", deserialize_with = "deserialize_duration", default)]
@@ -160,7 +162,9 @@ pub struct Album {
     pub id: AlbumId<'static>,
     #[serde(default)]
     pub release_date: String,
+    #[serde(default)]
     pub name: String,
+    #[serde(default)]
     pub artists: Vec<Artist>,
     #[serde(rename = "album_type")]
     pub typ: Option<rspotify::model::AlbumType>,
@@ -174,27 +178,50 @@ pub struct Album {
 /// A Spotify artist
 pub struct Artist {
     pub id: ArtistId<'static>,
+    #[serde(default)]
     pub name: String,
+    #[serde(default)]
+    pub genres: Vec<String>,
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 /// A Spotify playlist
 pub struct Playlist {
     pub id: PlaylistId<'static>,
+    #[serde(default)]
     pub collaborative: bool,
+    #[serde(default)]
     pub name: String,
+    #[serde(deserialize_with = "deserialize_playlist_owner")]
     pub owner: (String, UserId<'static>),
+    #[serde(default)]
     pub desc: String,
     /// which folder id the playlist refers to
     #[serde(default)]
     pub current_folder_id: usize,
+    #[serde(default)]
     pub snapshot_id: String,
+}
+
+fn deserialize_playlist_owner<'de, D>(deserializer: D) -> Result<(String, UserId<'static>), D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    struct Owner {
+        #[serde(default)]
+        display_name: Option<String>,
+        id: UserId<'static>,
+    }
+    let owner = Owner::deserialize(deserializer)?;
+    Ok((owner.display_name.unwrap_or_default(), owner.id))
 }
 
 #[derive(Deserialize, Serialize, Debug, Clone)]
 /// A Spotify show (podcast)
 pub struct Show {
     pub id: ShowId<'static>,
+    #[serde(default)]
     pub name: String,
 }
 
@@ -202,6 +229,7 @@ pub struct Show {
 /// A Spotify episode (podcast episode)
 pub struct Episode {
     pub id: EpisodeId<'static>,
+    #[serde(default)]
     pub name: String,
     #[serde(default)]
     pub description: String,
@@ -505,6 +533,11 @@ impl Album {
             _ => String::new(),
         }
     }
+
+    /// tries to convert from a `serde_json::Value` into `Album`
+    pub fn try_from_simplified_album_value(value: serde_json::Value) -> Option<Self> {
+        serde_json::from_value(value).ok()
+    }
 }
 
 impl From<rspotify::model::FullAlbum> for Album {
@@ -549,6 +582,7 @@ impl Artist {
         Some(Self {
             id: artist.id?,
             name: artist.name,
+            genres: vec![],
         })
     }
 }
@@ -558,6 +592,7 @@ impl From<rspotify::model::FullArtist> for Artist {
         Self {
             name: artist.name,
             id: artist.id,
+            genres: artist.genres,
         }
     }
 }

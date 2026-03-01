@@ -838,7 +838,7 @@ impl AppClient {
     /// Get the saved (liked) tracks of the current user
     pub async fn current_user_saved_tracks(&self) -> Result<Vec<Track>> {
         let tracks = self
-            .all_paging_items::<rspotify::model::SavedTrack>(
+            .all_paging_items::<serde_json::Value>(
                 &format!("{SPOTIFY_API_ENDPOINT}/me/tracks"),
                 0, // we don't know the total number of saved tracks beforehand
             )
@@ -846,7 +846,16 @@ impl AppClient {
 
         Ok(tracks
             .into_iter()
-            .filter_map(|t| Track::try_from_full_track(t.track))
+            .filter_map(|v| {
+                let track_v = v.get("track")?.clone();
+                let mut track = Track::try_from_value(track_v)?;
+                if let Some(added_at) = v.get("added_at").and_then(|v| v.as_str()) {
+                    if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(added_at) {
+                        track.added_at = ts.timestamp() as u64;
+                    }
+                }
+                Some(track)
+            })
             .collect())
     }
 
@@ -871,7 +880,7 @@ impl AppClient {
     /// Get the top tracks of the current user
     pub async fn current_user_top_tracks(&self) -> Result<Vec<Track>> {
         let tracks = match self
-            .all_paging_items::<rspotify::model::FullTrack>(
+            .all_paging_items::<serde_json::Value>(
                 &format!("{SPOTIFY_API_ENDPOINT}/me/top/tracks"),
                 0, // we don't know the total number of top tracks beforehand
             )
@@ -884,16 +893,13 @@ impl AppClient {
             }
         };
 
-        Ok(tracks
-            .into_iter()
-            .filter_map(Track::try_from_full_track)
-            .collect())
+        Ok(tracks.into_iter().filter_map(Track::try_from_value).collect())
     }
 
     /// Get all playlists of the current user
     pub async fn current_user_playlists(&self) -> Result<Vec<Playlist>> {
         let playlists = self
-            .all_paging_items::<rspotify::model::SimplifiedPlaylist>(
+            .all_paging_items::<serde_json::Value>(
                 &format!("{SPOTIFY_API_ENDPOINT}/me/playlists"),
                 0, // we don't know the total number of playlists beforehand
             )
@@ -901,7 +907,7 @@ impl AppClient {
 
         Ok(playlists
             .into_iter()
-            .map(std::convert::Into::into)
+            .filter_map(|v| serde_json::from_value(v).ok())
             .collect())
     }
 
@@ -932,32 +938,49 @@ impl AppClient {
     /// Get all saved albums of the current user
     pub async fn current_user_saved_albums(&self) -> Result<Vec<Album>> {
         let albums = self
-            .all_paging_items::<rspotify::model::SavedAlbum>(
+            .all_paging_items::<serde_json::Value>(
                 &format!("{SPOTIFY_API_ENDPOINT}/me/albums"),
                 0, // we don't know the total number of saved albums beforehand
             )
             .await?;
 
-        // Converts `rspotify::model::SavedAlbum` into `state::Album`
-        Ok(albums.into_iter().map(Album::from).collect())
+        Ok(albums
+            .into_iter()
+            .filter_map(|v| {
+                let album_v = v.get("album")?.clone();
+                let mut album = Album::try_from_simplified_album_value(album_v)?;
+                if let Some(added_at) = v.get("added_at").and_then(|v| v.as_str()) {
+                    if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(added_at) {
+                        album.added_at = ts.timestamp() as u64;
+                    }
+                }
+                Some(album)
+            })
+            .collect())
     }
 
     /// Get all saved shows of the current user
     pub async fn current_user_saved_shows(&self) -> Result<Vec<Show>> {
         let shows = self
-            .all_paging_items::<rspotify::model::Show>(
+            .all_paging_items::<serde_json::Value>(
                 &format!("{SPOTIFY_API_ENDPOINT}/me/shows"),
                 0, // we don't know the total number of saved shows beforehand
             )
             .await?;
 
-        Ok(shows.into_iter().map(|s| s.show.into()).collect())
+        Ok(shows
+            .into_iter()
+            .filter_map(|v| {
+                let show_v = v.get("show")?.clone();
+                serde_json::from_value(show_v).ok()
+            })
+            .collect())
     }
 
     /// Get all albums of an artist
     pub async fn artist_albums(&self, artist_id: ArtistId<'_>) -> Result<Vec<Album>> {
         let albums = self
-            .all_paging_items::<rspotify::model::SimplifiedAlbum>(
+            .all_paging_items::<serde_json::Value>(
                 &format!(
                     "{SPOTIFY_API_ENDPOINT}/artists/{}/albums?include_groups=album,single",
                     artist_id.id()
@@ -966,10 +989,32 @@ impl AppClient {
             )
             .await?
             .into_iter()
-            .filter_map(Album::try_from_simplified_album)
+            .filter_map(Album::try_from_simplified_album_value)
             .collect();
 
         Ok(AppClient::process_artist_albums(albums))
+    }
+
+    pub async fn artist(&self, artist_id: ArtistId<'_>) -> Result<Artist> {
+        let url = format!("{SPOTIFY_API_ENDPOINT}/artists/{}", artist_id.id());
+        let v = self.http_get::<serde_json::Value>(&url, &Query::new()).await?;
+        serde_json::from_value(v).context("parse artist")
+    }
+
+    pub async fn artist_related_artists(&self, artist_id: ArtistId<'_>) -> Result<Vec<Artist>> {
+        #[derive(Deserialize)]
+        struct RelatedArtistsResponse {
+            artists: Vec<serde_json::Value>,
+        }
+
+        let url = format!("{SPOTIFY_API_ENDPOINT}/artists/{}/related-artists", artist_id.id());
+        let response = self.http_get::<RelatedArtistsResponse>(&url, &Query::new()).await?;
+
+        Ok(response
+            .artists
+            .into_iter()
+            .filter_map(|v| serde_json::from_value(v).ok())
+            .collect())
     }
 
     /// Start a playback
@@ -1074,35 +1119,80 @@ impl AppClient {
         let mut shows = vec![];
         let mut episodes = vec![];
 
-        if let Ok(rspotify::model::SearchResult::Tracks(p)) =
-            self.search_specific_type(query, rspotify::model::SearchType::Track).await
-        {
-            tracks = p.items.into_iter().filter_map(Track::try_from_full_track).collect();
+        let url = format!("{SPOTIFY_API_ENDPOINT}/search");
+        let payload = Query::from([
+            ("q", query),
+            ("type", "track,artist,album,playlist,show,episode"),
+            ("limit", "10"),
+        ]);
+
+        let result = self.http_get::<serde_json::Value>(&url, &payload).await?;
+
+        if let Some(t) = result.get("tracks") {
+            if let Ok(p) =
+                serde_json::from_value::<rspotify::model::Page<serde_json::Value>>(t.clone())
+            {
+                tracks = p
+                    .items
+                    .into_iter()
+                    .filter_map(Track::try_from_value)
+                    .collect();
+            }
         }
-        if let Ok(rspotify::model::SearchResult::Artists(p)) =
-            self.search_specific_type(query, rspotify::model::SearchType::Artist).await
-        {
-            artists = p.items.into_iter().map(std::convert::Into::into).collect();
+        if let Some(t) = result.get("artists") {
+            if let Ok(p) =
+                serde_json::from_value::<rspotify::model::Page<serde_json::Value>>(t.clone())
+            {
+                artists = p
+                    .items
+                    .into_iter()
+                    .filter_map(|v| serde_json::from_value(v).ok())
+                    .collect();
+            }
         }
-        if let Ok(rspotify::model::SearchResult::Albums(p)) =
-            self.search_specific_type(query, rspotify::model::SearchType::Album).await
-        {
-            albums = p.items.into_iter().filter_map(Album::try_from_simplified_album).collect();
+        if let Some(t) = result.get("albums") {
+            if let Ok(p) =
+                serde_json::from_value::<rspotify::model::Page<serde_json::Value>>(t.clone())
+            {
+                albums = p
+                    .items
+                    .into_iter()
+                    .filter_map(Album::try_from_simplified_album_value)
+                    .collect();
+            }
         }
-        if let Ok(rspotify::model::SearchResult::Playlists(p)) =
-            self.search_specific_type(query, rspotify::model::SearchType::Playlist).await
-        {
-            playlists = p.items.into_iter().map(std::convert::Into::into).collect();
+        if let Some(t) = result.get("playlists") {
+            if let Ok(p) =
+                serde_json::from_value::<rspotify::model::Page<serde_json::Value>>(t.clone())
+            {
+                playlists = p
+                    .items
+                    .into_iter()
+                    .filter_map(|v| serde_json::from_value(v).ok())
+                    .collect();
+            }
         }
-        if let Ok(rspotify::model::SearchResult::Shows(p)) =
-            self.search_specific_type(query, rspotify::model::SearchType::Show).await
-        {
-            shows = p.items.into_iter().map(std::convert::Into::into).collect();
+        if let Some(t) = result.get("shows") {
+            if let Ok(p) =
+                serde_json::from_value::<rspotify::model::Page<serde_json::Value>>(t.clone())
+            {
+                shows = p
+                    .items
+                    .into_iter()
+                    .filter_map(|v| serde_json::from_value(v).ok())
+                    .collect();
+            }
         }
-        if let Ok(rspotify::model::SearchResult::Episodes(p)) =
-            self.search_specific_type(query, rspotify::model::SearchType::Episode).await
-        {
-            episodes = p.items.into_iter().map(std::convert::Into::into).collect();
+        if let Some(t) = result.get("episodes") {
+            if let Ok(p) =
+                serde_json::from_value::<rspotify::model::Page<serde_json::Value>>(t.clone())
+            {
+                episodes = p
+                    .items
+                    .into_iter()
+                    .filter_map(|v| serde_json::from_value(v).ok())
+                    .collect();
+            }
         }
 
         Ok(SearchResults {
@@ -1573,26 +1663,36 @@ impl AppClient {
         })
     }
 
+    /// Get a show data
+    pub async fn get_a_show(&self, show_id: ShowId<'_>, market: Option<rspotify::model::Market>) -> Result<serde_json::Value> {
+        let url = format!("{SPOTIFY_API_ENDPOINT}/shows/{}", show_id.id());
+        let mut query = Query::new();
+        if let Some(market) = market {
+            query.insert("market", <&str>::from(market));
+        }
+        self.http_get::<serde_json::Value>(&url, &query).await
+    }
+
     /// Get a show context data
     pub async fn show_context(&self, show_id: ShowId<'_>) -> Result<Context> {
         let show_uri = show_id.uri();
         tracing::info!("Get show context: {}", show_uri);
 
-        let show = self.get_a_show(show_id.clone(), None).await?;
+        let show_v = self.get_a_show(show_id.clone(), Some(rspotify::model::Market::FromToken)).await?;
+        let show: Show = serde_json::from_value(show_v.clone()).context("parse show")?;
+
+        let total_episodes = show_v.get("episodes").and_then(|e| e.get("total")).and_then(|t| t.as_u64()).unwrap_or(0) as usize;
 
         // get the show's episodes
         let episodes = self
-            .all_paging_items::<rspotify::model::SimplifiedEpisode>(
+            .all_paging_items::<serde_json::Value>(
                 &format!("{SPOTIFY_API_ENDPOINT}/shows/{}/episodes", show_id.id()),
-                show.episodes.total as usize,
+                total_episodes,
             )
             .await?
             .into_iter()
-            .map(std::convert::Into::into)
+            .filter_map(|v| serde_json::from_value(v).ok())
             .collect::<Vec<_>>();
-
-        // converts `rspotify::model::FullShow` into `state::Show`
-        let show: Show = show.into();
 
         Ok(Context::Show { show, episodes })
     }
