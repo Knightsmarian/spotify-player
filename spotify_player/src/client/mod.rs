@@ -1822,7 +1822,15 @@ impl AppClient {
                     json.clone()
                 };
 
-                let mut items = serde_json::from_value::<Vec<T>>(items_v)?;
+                let mut items = if items_v.is_array() {
+                    serde_json::from_value::<Vec<T>>(items_v)?
+                } else {
+                    // try to parse as a Page object
+                    match serde_json::from_value::<rspotify::model::Page<T>>(items_v) {
+                        Ok(p) => p.items,
+                        Err(_) => vec![],
+                    }
+                };
 
                 if items.is_empty() {
                     found_empty = true;

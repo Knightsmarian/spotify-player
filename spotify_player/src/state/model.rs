@@ -134,7 +134,7 @@ pub struct Device {
 #[derive(Deserialize, Serialize, Debug, Clone)]
 /// A Spotify track
 pub struct Track {
-    #[serde(alias = "uri")]
+    #[serde(alias = "uri", default = "default_track_id")]
     pub id: TrackId<'static>,
     #[serde(default)]
     pub name: String,
@@ -149,6 +149,10 @@ pub struct Track {
     pub added_at: u64,
 }
 
+fn default_track_id() -> TrackId<'static> {
+    TrackId::from_id("unknown").unwrap()
+}
+
 fn deserialize_duration<'de, D>(deserializer: D) -> Result<std::time::Duration, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -160,7 +164,7 @@ where
 #[derive(Deserialize, Serialize, Debug, Clone)]
 /// A Spotify album
 pub struct Album {
-    #[serde(alias = "uri")]
+    #[serde(alias = "uri", default = "default_album_id")]
     pub id: AlbumId<'static>,
     #[serde(default)]
     pub release_date: String,
@@ -176,10 +180,14 @@ pub struct Album {
     pub added_at: u64,
 }
 
+fn default_album_id() -> AlbumId<'static> {
+    AlbumId::from_id("unknown").unwrap()
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
 /// A Spotify artist
 pub struct Artist {
-    #[serde(alias = "uri")]
+    #[serde(alias = "uri", default = "default_artist_id")]
     pub id: ArtistId<'static>,
     #[serde(default)]
     pub name: String,
@@ -187,10 +195,14 @@ pub struct Artist {
     pub genres: Vec<String>,
 }
 
+fn default_artist_id() -> ArtistId<'static> {
+    ArtistId::from_id("unknown").unwrap()
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
 /// A Spotify playlist
 pub struct Playlist {
-    #[serde(alias = "uri")]
+    #[serde(alias = "uri", default = "default_playlist_id")]
     pub id: PlaylistId<'static>,
     #[serde(default)]
     pub collaborative: bool,
@@ -205,6 +217,10 @@ pub struct Playlist {
     pub current_folder_id: usize,
     #[serde(default)]
     pub snapshot_id: String,
+}
+
+fn default_playlist_id() -> PlaylistId<'static> {
+    PlaylistId::from_id("unknown").unwrap()
 }
 
 fn deserialize_playlist_owner<'de, D>(deserializer: D) -> Result<(String, UserId<'static>), D::Error>
@@ -225,16 +241,20 @@ where
 #[derive(Deserialize, Serialize, Debug, Clone)]
 /// A Spotify show (podcast)
 pub struct Show {
-    #[serde(alias = "uri")]
+    #[serde(alias = "uri", default = "default_show_id")]
     pub id: ShowId<'static>,
     #[serde(default)]
     pub name: String,
 }
 
+fn default_show_id() -> ShowId<'static> {
+    ShowId::from_id("unknown").unwrap()
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
 /// A Spotify episode (podcast episode)
 pub struct Episode {
-    #[serde(alias = "uri")]
+    #[serde(alias = "uri", default = "default_episode_id")]
     pub id: EpisodeId<'static>,
     #[serde(default)]
     pub name: String,
@@ -247,6 +267,10 @@ pub struct Episode {
     pub release_date: String,
     #[serde(default)]
     pub images: Vec<rspotify::model::Image>,
+}
+
+fn default_episode_id() -> EpisodeId<'static> {
+    EpisodeId::from_id("unknown").unwrap()
 }
 
 impl Episode {
