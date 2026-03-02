@@ -861,16 +861,29 @@ impl AppClient {
 
     /// Get the recently played tracks of the current user
     pub async fn current_user_recently_played_tracks(&self) -> Result<Vec<Track>> {
-        let first_page = self.current_user_recently_played(Some(50), None).await?;
+        let url = format!("{SPOTIFY_API_ENDPOINT}/me/player/recently-played?limit=50");
+        let mut response_v = self.http_get::<serde_json::Value>(&url, &Query::new()).await?;
 
-        let play_histories = self.all_cursor_based_paging_items(first_page).await?;
+        let mut tracks = Vec::new();
+        let mut seen_names = HashSet::new();
 
-        // de-duplicate the tracks returned from the recently-played API
-        let mut tracks = Vec::<Track>::new();
-        for history in play_histories {
-            if !tracks.iter().any(|t| t.name == history.track.name) {
-                if let Some(track) = Track::try_from_full_track(history.track) {
-                    tracks.push(track);
+        loop {
+            if let Some(items) = response_v.get("items").and_then(|i| i.as_array()) {
+                for item in items {
+                    if let Some(track_v) = item.get("track") {
+                        if let Some(track) = Track::try_from_value(track_v.clone()) {
+                            if seen_names.insert(track.name.clone()) {
+                                tracks.push(track);
+                            }
+                        }
+                    }
+                }
+            }
+
+            match response_v.get("next").and_then(|n| n.as_str()) {
+                None => break,
+                Some(url) => {
+                    response_v = self.http_get::<serde_json::Value>(url, &Query::new()).await?;
                 }
             }
         }
@@ -913,26 +926,32 @@ impl AppClient {
 
     /// Get all followed artists of the current user
     pub async fn current_user_followed_artists(&self) -> Result<Vec<Artist>> {
-        let first_page = self
-            .deref()
-            .current_user_followed_artists(None, None)
-            .await?;
+        let url = format!("{SPOTIFY_API_ENDPOINT}/me/following?type=artist");
+        let mut response_v = self.http_get::<serde_json::Value>(&url, &Query::new()).await?;
 
-        // followed artists pagination is handled different from
-        // other paginations. The endpoint uses cursor-based pagination.
-        let mut artists = first_page.items;
-        let mut maybe_next = first_page.next;
-        while let Some(url) = maybe_next {
-            let mut next_page = self
-                .http_get::<rspotify::model::CursorPageFullArtists>(&url, &Query::new())
-                .await?
-                .artists;
-            artists.append(&mut next_page.items);
-            maybe_next = next_page.next;
+        let mut artists = Vec::new();
+        loop {
+            let artists_obj = match response_v.get("artists") {
+                Some(a) => a,
+                None => break,
+            };
+
+            if let Some(items) = artists_obj.get("items").and_then(|i| i.as_array()) {
+                for item in items {
+                    if let Ok(artist) = serde_json::from_value(item.clone()) {
+                        artists.push(artist);
+                    }
+                }
+            }
+
+            match artists_obj.get("next").and_then(|n| n.as_str()) {
+                None => break,
+                Some(url) => {
+                    response_v = self.http_get::<serde_json::Value>(url, &Query::new()).await?;
+                }
+            }
         }
-
-        // converts `rspotify::model::FullArtist` into `state::Artist`
-        Ok(artists.into_iter().map(std::convert::Into::into).collect())
+        Ok(artists)
     }
 
     /// Get all saved albums of the current user
@@ -1534,8 +1553,7 @@ impl AppClient {
             pub owner: serde_json::Value,
             pub description: Option<String>,
             pub snapshot_id: String,
-            #[serde(alias = "items")]
-            pub tracks: rspotify::model::Page<serde_json::Value>,
+            pub tracks: serde_json::Value,
         }
 
         let playlist_v = self
@@ -1546,13 +1564,15 @@ impl AppClient {
             .await?;
         let playlist: FlexiblePlaylist = serde_json::from_value(playlist_v.clone()).context("parse playlist")?;
 
+        let total_tracks = playlist.tracks.get("total").and_then(|t| t.as_u64()).unwrap_or(0) as usize;
+
         let tracks = self
             .all_paging_items::<serde_json::Value>(
                 &format!(
                     "{SPOTIFY_API_ENDPOINT}/playlists/{}/tracks",
                     playlist_id.id(),
                 ),
-                playlist.tracks.total as usize,
+                total_tracks,
             )
             .await?
             .into_iter()
@@ -1753,20 +1773,36 @@ impl AppClient {
                         ("limit", &limit_str),
                         ("offset", &offset_str),
                     ]);
-                    self.http_get::<rspotify::model::Page<T>>(base_url, &params)
-                        .await
+                    self.http_get::<serde_json::Value>(base_url, &params).await
                 });
             }
 
             let results = futures::future::try_join_all(futures).await?;
 
             let mut found_empty = false;
-            for mut page in results {
-                if page.items.is_empty() {
+            for json in results {
+                // Spotify API can return either a Page object or just a list of items
+                // for some endpoints. all_paging_items usually expects a Page object.
+                let items_v = if let Some(items) = json.get("items") {
+                    items.clone()
+                } else if let Some(tracks) = json.get("tracks") {
+                    // some endpoints like /albums/{id} return tracks in a "tracks" field
+                    if let Some(items) = tracks.get("items") {
+                        items.clone()
+                    } else {
+                        json.clone()
+                    }
+                } else {
+                    json.clone()
+                };
+
+                let mut items = serde_json::from_value::<Vec<T>>(items_v)?;
+
+                if items.is_empty() {
                     found_empty = true;
                     break;
                 }
-                all_items.append(&mut page.items);
+                all_items.append(&mut items);
             }
 
             if found_empty {
