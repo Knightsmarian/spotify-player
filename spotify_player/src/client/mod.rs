@@ -1553,7 +1553,8 @@ impl AppClient {
             pub owner: serde_json::Value,
             pub description: Option<String>,
             pub snapshot_id: String,
-            pub tracks: serde_json::Value,
+            pub tracks: Option<serde_json::Value>,
+            pub items: Option<serde_json::Value>,
         }
 
         let playlist_v = self
@@ -1564,12 +1565,13 @@ impl AppClient {
             .await?;
         let playlist: FlexiblePlaylist = serde_json::from_value(playlist_v.clone()).context("parse playlist")?;
 
-        let total_tracks = playlist.tracks.get("total").and_then(|t| t.as_u64()).unwrap_or(0) as usize;
+        let tracks_v = playlist.items.or(playlist.tracks).unwrap_or_default();
+        let total_tracks = tracks_v.get("total").and_then(|t| t.as_u64()).unwrap_or(0) as usize;
 
         let tracks = self
             .all_paging_items::<serde_json::Value>(
                 &format!(
-                    "{SPOTIFY_API_ENDPOINT}/playlists/{}/tracks",
+                    "{SPOTIFY_API_ENDPOINT}/playlists/{}/items",
                     playlist_id.id(),
                 ),
                 total_tracks,
@@ -1616,15 +1618,32 @@ impl AppClient {
             .await?;
         let state_album: Album = serde_json::from_value(album_v.clone()).context("parse album")?;
 
-        let total_tracks = album_v.get("tracks").and_then(|t| t.get("total")).and_then(|t| t.as_u64()).unwrap_or(0) as usize;
+        let total_tracks = album_v
+            .get("tracks")
+            .or_else(|| album_v.get("items"))
+            .and_then(|t| t.get("total"))
+            .and_then(|t| t.as_u64())
+            .unwrap_or(0) as usize;
 
         // get the album's tracks
-        let tracks = self
+        // try /tracks then /items
+        let mut tracks_v = self
             .all_paging_items::<serde_json::Value>(
                 &format!("{SPOTIFY_API_ENDPOINT}/albums/{}/tracks", album_id.id()),
                 total_tracks,
             )
-            .await?
+            .await;
+
+        if tracks_v.is_err() {
+            tracks_v = self
+                .all_paging_items::<serde_json::Value>(
+                    &format!("{SPOTIFY_API_ENDPOINT}/albums/{}/items", album_id.id()),
+                    total_tracks,
+                )
+                .await;
+        }
+
+        let tracks = tracks_v?
             .into_iter()
             .filter_map(|v| {
                 let mut track = Track::try_from_simplified_track_value(v)?;
@@ -1646,17 +1665,24 @@ impl AppClient {
 
         let artist = self.artist(artist_id.as_ref()).await?;
 
-        let top_tracks_v = self
+        let top_tracks = match self
             .http_get::<serde_json::Value>(
                 &format!("{SPOTIFY_API_ENDPOINT}/artists/{}/top-tracks", artist_id.id()),
                 &Query::from([("market", "from_token")]),
             )
-            .await?;
-        
-        let top_tracks = top_tracks_v.get("tracks")
-            .and_then(|t| t.as_array())
-            .map(|a| a.iter().filter_map(|v| Track::try_from_value(v.clone())).collect())
-            .unwrap_or_default();
+            .await
+        {
+            Ok(v) => v
+                .get("tracks")
+                .and_then(|t| t.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| Track::try_from_value(v.clone()))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            Err(_) => vec![],
+        };
 
         let related_artists = self.artist_related_artists(artist_id.as_ref()).await.unwrap_or_default();
 
